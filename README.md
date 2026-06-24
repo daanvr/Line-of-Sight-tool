@@ -26,6 +26,9 @@ It's a single self-contained `index.html` (no build step) using
 - **Polygon select → Locator Tool** — lasso an area to open all enclosed photos for geolocating.
 - **Shareable URL** — the map position lives in the URL hash (`#map=zoom/lat/lon/bearing/pitch`),
   so a reload (or a shared link) restores the exact view.
+- **Remembers your session** — all panel settings (layers, filters, basemap, terrain), the
+  collapsed/open state, the search box, the open photo, and the map view are saved in your
+  browser, so a reload brings the page back exactly as you left it.
 
 ## Usage
 

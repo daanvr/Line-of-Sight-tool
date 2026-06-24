@@ -283,7 +283,7 @@
 
   <div id="status"><span class="spinner"></span><span id="status-text">Move the map to load photos…</span></div>
 
-  <div id="panel">
+  <div id="panel" class="collapsed">
     <div class="phead"><span>Layers · filters · basemap</span><span class="chev">▾</span></div>
     <div class="pbody"><!-- built by JS from CONFIG --></div>
   </div>
@@ -361,6 +361,17 @@
     let clickTimer = null;         // single- vs double-click discrimination
     let $selectBtn = null;         // the "Select area" button (built into the panel)
 
+    // ---- Persisted UI state (localStorage) -----------------------------------
+    const LS_KEY = "los-state-v1";
+    let lastSearch = "";                 // geocoder query / chosen place text
+    let savedMapView = null;             // {center,zoom,bearing,pitch} fallback when the URL has no #map hash
+    let pendingPanelCollapsed = true;    // panel is collapsed by default (until the user opens it / saved state says otherwise)
+    let pendingModal = null;             // {url,title} photo to re-open on load
+    let modalState = { open: false, url: null, title: null };
+    // Hydrate CONFIG / FILTERS / basemap / terrain / search / modal BEFORE the map,
+    // panel, and layers are built so everything comes up exactly as it was left.
+    loadSavedState();
+
     // ---- Data stores ---------------------------------------------------------
     const seen = new Set();                          // de-dupe by file url
     const order = [];                                // url insertion order (FIFO eviction)
@@ -405,8 +416,8 @@
     const $ctx        = document.getElementById("ctxmenu");
 
     // ---- Map -----------------------------------------------------------------
-    // Restore view from the URL hash if present, else the Djémila default.
-    const startView = readHash();
+    // Restore view from the URL hash, else the last saved view, else Djémila.
+    const startView = readHash() || savedMapView;
     const map = new mapboxgl.Map({
       container: "map",
       style: "mapbox://styles/mapbox/" + currentStyle,
@@ -417,13 +428,14 @@
       antialias: false
     });
 
-    map.addControl(
-      new MapboxGeocoder({ accessToken: mapboxgl.accessToken, mapboxgl: mapboxgl, marker: false }),
-      "top-right"
-    );
+    const geocoder = new MapboxGeocoder({ accessToken: mapboxgl.accessToken, mapboxgl: mapboxgl, marker: false });
+    map.addControl(geocoder, "top-right");
+    geocoder.on("result", function (e) { lastSearch = (e.result && (e.result.place_name || e.result.text)) || lastSearch; saveStateDebounced(); });
+    geocoder.on("clear", function () { lastSearch = ""; saveStateDebounced(); });
     map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), "top-right");
 
-    buildPanel();   // build the interactive layers/filters/basemap panel from CONFIG
+    buildPanel();        // build the interactive layers/filters/basemap panel from CONFIG
+    applyRestoredUI();   // restore panel-collapse, search text, and any open photo modal
 
     // Runs on the initial load AND again after every setStyle (basemap switch),
     // which wipes custom sources/layers — so everything is re-added idempotently.
@@ -522,7 +534,7 @@
     });
 
     const debouncedLoad = debounce(load, 350);
-    map.on("moveend", function () { writeHash(); debouncedLoad(); });
+    map.on("moveend", function () { writeHash(); saveStateDebounced(); debouncedLoad(); });
     map.on("zoomend", rebuildCones);
     map.on("zoom", debounce(rebuildCones, 60));
     map.on("error", function (e) { console.warn("Mapbox error:", e && e.error); });
@@ -683,6 +695,8 @@
         '</div>';
       $modal.classList.add("show");
       $map.classList.add("blur");
+      modalState = { open: true, url: p.url, title: p.title };
+      saveState();
       const token = ++modalToken;
       fetchAttribution(p.title).then(function (a) {
         if (token !== modalToken) return;        // modal closed or changed
@@ -698,6 +712,8 @@
       $map.classList.remove("blur");
       $modalImg.src = "";
       modalToken++;   // discard any pending attribution fill
+      modalState = { open: false, url: null, title: null };
+      saveState();
     }
     document.getElementById("modal-close").addEventListener("click", closeModal);
     $modal.addEventListener("click", function (e) { if (e.target === $modal) closeModal(); });
@@ -1087,18 +1103,17 @@
       const $panel = document.getElementById("panel");
       const $body  = $panel.querySelector(".pbody");
 
+      const losBtn = function (v, label) { return '<button data-los="' + v + '"' + (FILTERS.los === v ? ' class="on"' : '') + '>' + label + '</button>'; };
       const filtersHtml =
         '<div class="sect"><div class="lbl">Filters</div>' +
-          '<div class="frow"><span class="k">Length ≥</span><input type="range" id="f-minlen" min="0" max="' + LEN_MAX + '" step="10" value="0"><span class="v" id="f-minlen-v">0 m</span></div>' +
-          '<div class="frow"><span class="k">Length ≤</span><input type="range" id="f-maxlen" min="0" max="' + LEN_MAX + '" step="10" value="' + LEN_MAX + '"><span class="v" id="f-maxlen-v">∞</span></div>' +
+          '<div class="frow"><span class="k">Length ≥</span><input type="range" id="f-minlen" min="0" max="' + LEN_MAX + '" step="10" value="' + FILTERS.minLen + '"><span class="v" id="f-minlen-v">' + Math.round(FILTERS.minLen) + ' m</span></div>' +
+          '<div class="frow"><span class="k">Length ≤</span><input type="range" id="f-maxlen" min="0" max="' + LEN_MAX + '" step="10" value="' + FILTERS.maxLen + '"><span class="v" id="f-maxlen-v">' + (FILTERS.maxLen >= LEN_MAX ? "∞" : Math.round(FILTERS.maxLen) + " m") + '</span></div>' +
           '<div class="row"><span class="k">Sight</span><div class="seg" id="los-seg">' +
-            '<button data-los="all" class="on">Any</button>' +
-            '<button data-los="los">Has</button>' +
-            '<button data-los="nolos">None</button>' +
+            losBtn("all", "Any") + losBtn("los", "Has") + losBtn("nolos", "None") +
           '</div></div>' +
-          '<div class="frow"><span class="k">Facing ≥</span><input type="range" id="f-bmin" min="0" max="360" step="5" value="0"><span class="v" id="f-bmin-v">0°</span></div>' +
-          '<div class="frow"><span class="k">Facing ≤</span><input type="range" id="f-bmax" min="0" max="360" step="5" value="360"><span class="v" id="f-bmax-v">360°</span></div>' +
-          '<div class="readout" id="f-bnote"></div>' +
+          '<div class="frow"><span class="k">Facing ≥</span><input type="range" id="f-bmin" min="0" max="360" step="5" value="' + FILTERS.bearMin + '"><span class="v" id="f-bmin-v">' + Math.round(FILTERS.bearMin) + '°</span></div>' +
+          '<div class="frow"><span class="k">Facing ≤</span><input type="range" id="f-bmax" min="0" max="360" step="5" value="' + FILTERS.bearMax + '"><span class="v" id="f-bmax-v">' + Math.round(FILTERS.bearMax) + '°</span></div>' +
+          '<div class="readout" id="f-bnote">' + (FILTERS.bearMin > FILTERS.bearMax ? "wraps through North (0°)" : "") + '</div>' +
         '</div>';
 
       const layerDefs = [
@@ -1144,7 +1159,7 @@
     }
 
     function wirePanel($panel, $body) {
-      $panel.querySelector(".phead").addEventListener("click", function () { $panel.classList.toggle("collapsed"); });
+      $panel.querySelector(".phead").addEventListener("click", function () { $panel.classList.toggle("collapsed"); saveStateDebounced(); });
 
       // Layer visibility / color / size / opacity / ramp (delegated).
       function onLayerControl(e) {
@@ -1160,6 +1175,7 @@
         CONFIG[layer][prop] = val;
         applyLayerStyle(layer);
         if (layer === "cones" && (prop === "pxSize" || prop === "ramp")) rebuildConesDebounced();
+        saveStateDebounced();
       }
       $body.addEventListener("input", onLayerControl);
       $body.addEventListener("change", onLayerControl);
@@ -1173,6 +1189,7 @@
         minV.textContent = Math.round(FILTERS.minLen) + " m";
         maxV.textContent = FILTERS.maxLen >= LEN_MAX ? "∞" : Math.round(FILTERS.maxLen) + " m";
         applyFilters();
+        saveStateDebounced();
       }
       minS.addEventListener("input", onLen);
       maxS.addEventListener("input", onLen);
@@ -1185,6 +1202,7 @@
         FILTERS.los = b.getAttribute("data-los");
         Array.prototype.forEach.call(seg.querySelectorAll("button"), function (x) { x.classList.toggle("on", x === b); });
         applyFilters();
+        saveStateDebounced();
       });
 
       // Orientation filter (with wrap-around).
@@ -1198,16 +1216,18 @@
         bmaxV.textContent = Math.round(FILTERS.bearMax) + "°";
         bnote.textContent = FILTERS.bearMin > FILTERS.bearMax ? "wraps through North (0°)" : "";
         applyFilters();
+        saveStateDebounced();
       }
       bminS.addEventListener("input", onBear);
       bmaxS.addEventListener("input", onBear);
 
       // Basemap + terrain.
-      document.getElementById("basemap-sel").addEventListener("change", function (e) { switchBasemap(e.target.value); });
+      document.getElementById("basemap-sel").addEventListener("change", function (e) { switchBasemap(e.target.value); saveStateDebounced(); });
       document.getElementById("terrain-toggle").addEventListener("change", function (e) {
         terrainOn = e.target.checked;
         if (terrainOn) map.setTerrain({ source: "mapbox-dem", exaggeration: 1.4 });
         else map.setTerrain(null);
+        saveStateDebounced();
       });
 
       $selectBtn = document.getElementById("select-btn");
@@ -1333,6 +1353,62 @@
                 "/" + map.getBearing().toFixed(1) + "/" + map.getPitch().toFixed(0);
       try { history.replaceState(history.state, "", h); }
       catch (e) { location.hash = h; }
+    }
+
+    // ---- Browser-persisted UI state ------------------------------------------
+    // Everything the user can change (layers, filters, basemap, terrain, panel
+    // open/closed, search text, the open photo, and the map view) is mirrored to
+    // localStorage so a reload comes back exactly as it was left.
+    function saveState() {
+      try {
+        const state = {
+          config: CONFIG,
+          filters: FILTERS,
+          basemap: currentStyle,
+          terrain: terrainOn,
+          panelCollapsed: !!(document.getElementById("panel") && document.getElementById("panel").classList.contains("collapsed")),
+          search: lastSearch,
+          modal: modalState
+        };
+        if (typeof map !== "undefined" && map) {
+          const c = map.getCenter();
+          state.map = { center: [c.lng, c.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() };
+        }
+        localStorage.setItem(LS_KEY, JSON.stringify(state));
+      } catch (e) { /* storage disabled / full / serialization issue — ignore */ }
+    }
+    const saveStateDebounced = debounce(saveState, 200);
+
+    // Runs once, very early (before the map/panel/layers are built).
+    function loadSavedState() {
+      let s;
+      try { s = JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch (e) { s = null; }
+      if (!s || typeof s !== "object") return;
+      if (s.config) Object.keys(CONFIG).forEach(function (layer) {
+        const sv = s.config[layer]; if (!sv) return;
+        Object.keys(CONFIG[layer]).forEach(function (k) { if (sv[k] !== undefined) CONFIG[layer][k] = sv[k]; });
+      });
+      if (s.filters) Object.keys(FILTERS).forEach(function (k) { if (s.filters[k] !== undefined) FILTERS[k] = s.filters[k]; });
+      if (s.basemap && BASEMAPS.some(function (b) { return b.id === s.basemap; })) currentStyle = s.basemap;
+      if (typeof s.terrain === "boolean") terrainOn = s.terrain;
+      if (typeof s.search === "string") lastSearch = s.search;
+      if (typeof s.panelCollapsed === "boolean") pendingPanelCollapsed = s.panelCollapsed;
+      if (s.modal && s.modal.open && s.modal.url && s.modal.title) pendingModal = { url: s.modal.url, title: s.modal.title };
+      if (s.map && Array.isArray(s.map.center) && isFinite(s.map.zoom)) {
+        savedMapView = { center: s.map.center, zoom: s.map.zoom, bearing: s.map.bearing || 0, pitch: s.map.pitch || 0 };
+      }
+    }
+
+    // Runs once after the panel + geocoder exist: restore collapse, search box, modal.
+    function applyRestoredUI() {
+      const panel = document.getElementById("panel");
+      if (panel) panel.classList.toggle("collapsed", pendingPanelCollapsed);
+      const gi = document.querySelector(".mapboxgl-ctrl-geocoder input");
+      if (gi) {
+        if (lastSearch) gi.value = lastSearch;
+        gi.addEventListener("input", function () { lastSearch = gi.value; saveStateDebounced(); });
+      }
+      if (pendingModal) openModal(pendingModal);
     }
   })();
   </script>

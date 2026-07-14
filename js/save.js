@@ -1,0 +1,326 @@
+/* Line of Sight tool — save: writing location edits back to Commons.
+
+   Wikitext templates ({{Location dec}} / {{Object location dec}}) are updated
+   through the MediaWiki REST API (CORS-friendly with a Bearer token). The
+   structured-data (SDC) statements — P1259 point of view / P9149 depicted
+   place — need the action API, which browsers can't reach authenticated
+   cross-origin, so SDC only happens behind the serve.py same-origin proxy.
+   Also owns the failed-save retry (auto backoff: 3s → 10s → 30s → manual). */
+(function () {
+  "use strict";
+  const LOS = (window.LOS = window.LOS || {});
+  const C = LOS.config;
+  const U = LOS.util;
+
+  // Local, git-ignored OAuth config: window.LOS_OAUTH = { accessToken: "…" }.
+  // Missing file is fine — saving is simply disabled.
+  const OAUTH_TOKEN = window.LOS_OAUTH?.accessToken || null;
+
+  let saving = false;
+
+  // ---- Failed-save retry --------------------------------------------------------
+  const RETRY_DELAYS = [3, 10, 30];
+  let saveFailed = false, retryAttempt = 0, retryTimer = null, retryCountdown = 0;
+
+  const $editbar = document.getElementById("editbar");
+  const $retryBtn = document.getElementById("retry-btn");
+
+  function clearRetryTimer() {
+    if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
+    retryCountdown = 0;
+  }
+  function updateRetryUI() {
+    $editbar.classList.toggle("failed", saveFailed);
+    if (saveFailed) $retryBtn.textContent = retryCountdown > 0 ? `Retry in ${retryCountdown}s` : "Try again";
+  }
+  function onSaveFailure() {
+    saveFailed = true;
+    const delay = RETRY_DELAYS[retryAttempt]; // past the schedule → manual only
+    retryAttempt++;
+    if (delay) {
+      retryCountdown = delay;
+      retryTimer = setInterval(() => {
+        retryCountdown--;
+        if (retryCountdown <= 0) { clearRetryTimer(); saveEdits(); }
+        else updateRetryUI();
+      }, 1000);
+    }
+    updateRetryUI();
+  }
+  function onSaveSuccess() {
+    saveFailed = false;
+    retryAttempt = 0;
+    clearRetryTimer();
+    updateRetryUI();
+  }
+
+  // ---- Wikitext: rewrite the location templates -----------------------------------
+  const normTpl = (s) => s.replace(/[_\s]+/g, " ").trim().toLowerCase();
+  const CAMERA_TPLS = ["location", "location dec", "location dms", "camera location", "camera location dec"];
+  const OBJECT_TPLS = ["object location", "object location dec", "object location dms"];
+
+  /** Find a brace-balanced {{name|…}} whose name is one of `names`. */
+  function findTemplate(text, names) {
+    const want = new Set(names);
+    let i = 0;
+    while ((i = text.indexOf("{{", i)) !== -1) {
+      let j = i + 2, depth = 1, nameEnd = -1;
+      while (j < text.length && depth > 0) {
+        if (text[j] === "{" && text[j + 1] === "{") { depth++; j += 2; continue; }
+        if (text[j] === "}" && text[j + 1] === "}") { depth--; j += 2; continue; }
+        if (depth === 1 && nameEnd === -1 && text[j] === "|") nameEnd = j;
+        j++;
+      }
+      if (depth !== 0) return null; // unbalanced wikitext — give up
+      const name = normTpl(text.slice(i + 2, nameEnd === -1 ? j - 2 : nameEnd));
+      if (want.has(name)) return { start: i, end: j, inner: text.slice(i + 2, j - 2) };
+      i += 2;
+    }
+    return null;
+  }
+
+  function locTemplate(kind, pos, oldInner) {
+    let extra = "";
+    if (oldInner) { // keep a heading:… if there was one
+      const m = /heading\s*[:=]\s*([^|{}\s]+)/i.exec(oldInner);
+      if (m) extra = `|heading:${m[1]}`;
+    }
+    return `{{${kind === "camera" ? "Location dec" : "Object location dec"}|${pos[1].toFixed(6)}|${pos[0].toFixed(6)}${extra}}}`;
+  }
+
+  /** Replace (or insert) the camera/object location template; returns new text. */
+  function applyLocToWikitext(text, kind, pos) {
+    const found = findTemplate(text, kind === "camera" ? CAMERA_TPLS : OBJECT_TPLS);
+    const tpl = locTemplate(kind, pos, found && found.inner);
+    if (found) return text.slice(0, found.start) + tpl + text.slice(found.end);
+    // Not present yet: sit next to the sibling location template if there is
+    // one, else go before the first category, else at the very end.
+    const sibling = findTemplate(text, kind === "camera" ? OBJECT_TPLS : CAMERA_TPLS);
+    if (sibling) {
+      return kind === "camera"
+        ? text.slice(0, sibling.start) + tpl + "\n" + text.slice(sibling.start)
+        : text.slice(0, sibling.end) + "\n" + tpl + text.slice(sibling.end);
+    }
+    const cat = text.search(/\[\[\s*category\s*:/i);
+    if (cat !== -1) return text.slice(0, cat) + tpl + "\n" + text.slice(cat);
+    return text.replace(/\s*$/, "") + "\n" + tpl + "\n";
+  }
+
+  // ---- Edit summaries ----------------------------------------------------------------
+  /** Deep link that reopens this tool with the photo loaded, selected, and the
+      map fitted to its full line of sight (camera + object) — see the URL
+      preload in main.js. Underscores keep the link readable in histories. */
+  function deepLink(title) {
+    return `${C.TOOL_URL}?file=${encodeURIComponent(String(title).replace(/^File:/, "").replace(/ /g, "_"))}`;
+  }
+
+  /** Human-readable per-edit description for the summary: what changed and by
+      how far ("Move camera position 38 m" / "Add object position"). */
+  function describeEdit(kind, from, to) {
+    const noun = kind === "camera" ? "camera position" : "object position";
+    return from
+      ? `Move ${noun} ${U.fmtDist(U.distance(from[0], from[1], to[0], to[1]))}`
+      : `Add ${noun}`;
+  }
+
+  function editSummary(descs, title) {
+    // External URLs don't render as links in edit summaries, but the deep
+    // link is still copyable and machine-parsable. Total stays well under
+    // the 500-codepoint summary limit.
+    return `${descs.join("; ")} — via Line of Sight tool | ${deepLink(title)}`;
+  }
+
+  // ---- Saving one photo (wikitext via the Core REST API) -------------------------------
+  async function savePhotoEdits(rec, token, sdcOn) {
+    const endpoint = C.REST_API + encodeURIComponent(rec.title);
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Api-User-Agent": "LineOfSightTool/0.1 (local testing)",
+    };
+    const g = await fetch(endpoint, { headers });
+    if (!g.ok) throw new Error(`couldn't fetch wikitext (HTTP ${g.status})`);
+    const page = await g.json();
+    let text = page.source;
+    const parts = [], descs = [];
+    if (LOS.store.posChanged(rec.cam, rec.origCam)) {
+      text = applyLocToWikitext(text, "camera", rec.cam);
+      parts.push("camera");
+      descs.push(describeEdit("camera", rec.origCam, rec.cam));
+    }
+    if (LOS.store.posChanged(rec.obj, rec.origObj)) {
+      text = applyLocToWikitext(text, "object", rec.obj);
+      parts.push("object");
+      descs.push(describeEdit("object", rec.origObj, rec.obj));
+    }
+    if (!parts.length) return;
+    const r = await fetch(endpoint, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({
+        source: text,
+        comment: editSummary(descs, rec.title),
+        latest: { id: page.latest.id },
+      }),
+    });
+    if (!r.ok) {
+      let msg = `save failed (HTTP ${r.status})`;
+      try {
+        const err = await r.json();
+        if (err && err.message) msg = err.message;
+      } catch { /* non-JSON error body */ }
+      throw new Error(msg);
+    }
+    // Keep the structured data (SDC) in sync with the wikitext templates.
+    if (sdcOn && rec.pageId) await saveSDCEdits(rec, token, parts);
+  }
+
+  // ---- Structured data (SDC) — via the serve.py same-origin proxy ----------------------
+  // The authenticated action API can't be reached cross-origin from a browser
+  // (its CORS mode anonymizes requests), so SDC edits only happen when the
+  // page is served by serve.py, which proxies /w/ to commons.wikimedia.org.
+  const SDC_API = "/w/api.php";
+  const SDC_CAMERA_PROP = "P1259"; // coordinates of the point of view
+  const SDC_OBJECT_PROP = "P9149"; // coordinates of depicted place
+  const SDC_GLOBE = "http://www.wikidata.org/entity/Q2";
+  let sdcProxyState = null; // null = not probed yet
+
+  async function detectSdcProxy() {
+    if (sdcProxyState !== null) return sdcProxyState;
+    try {
+      const r = await fetch(`${SDC_API}?action=query&meta=siteinfo&siprop=general&format=json`);
+      const j = r.ok ? await r.json() : null;
+      sdcProxyState = !!(j && j.query);
+    } catch {
+      sdcProxyState = false;
+    }
+    return sdcProxyState;
+  }
+
+  async function sdcCall(params, token) {
+    const opts = { headers: { "Authorization": `Bearer ${token}` } };
+    let url = SDC_API;
+    if (params instanceof URLSearchParams) { opts.method = "POST"; opts.body = params; }
+    else url += `?${params}`;
+    const r = await fetch(url, opts);
+    if (!r.ok) throw new Error(`SDC request failed (HTTP ${r.status})`);
+    const j = await r.json();
+    if (j.error) throw new Error(`SDC: ${j.error.info || j.error.code}`);
+    return j;
+  }
+
+  async function saveSDCEdits(rec, token, parts) {
+    const mid = `M${rec.pageId}`;
+    const eJ = await sdcCall(`action=wbgetentities&ids=${mid}&props=claims&format=json`, token);
+    const ent = eJ.entities && eJ.entities[mid];
+    let statements = (ent && (ent.statements || ent.claims)) || {};
+    if (Array.isArray(statements)) statements = {}; // empty SDC serializes as []
+
+    const tJ = await sdcCall("action=query&meta=tokens&type=csrf&format=json", token);
+    const csrf = tJ.query?.tokens?.csrftoken;
+    if (!csrf || csrf === "+\\") throw new Error("SDC: no CSRF token (OAuth session not accepted)");
+
+    for (const kind of parts) {
+      const prop = kind === "camera" ? SDC_CAMERA_PROP : SDC_OBJECT_PROP;
+      const pos = kind === "camera" ? rec.cam : rec.obj;
+      const coord = {
+        latitude: +pos[1].toFixed(6),
+        longitude: +pos[0].toFixed(6),
+        altitude: null,
+        precision: 1e-6,
+        globe: SDC_GLOBE,
+      };
+      const existing = statements[prop] && statements[prop][0];
+      // Summary mirrors the wikitext one: action + property + moved distance.
+      // NOTE: no `tags=` — a change tag (e.g. "line-of-sight-tool") must first
+      // be registered at Special:Tags on Commons; add it to this body then.
+      const oldVal = existing?.mainsnak?.datavalue?.value;
+      let summary = (existing ? "Move " : "Add ") +
+        (kind === "camera" ? "point-of-view coordinates (P1259)" : "depicted-place coordinates (P9149)");
+      if (oldVal && isFinite(oldVal.latitude) && isFinite(oldVal.longitude)) {
+        summary += ` ${U.fmtDist(U.distance(oldVal.longitude, oldVal.latitude, pos[0], pos[1]))}`;
+      }
+      summary += ` — via Line of Sight tool | ${deepLink(rec.title)}`;
+      const body = new URLSearchParams({ format: "json", token: csrf, maxlag: "5", summary });
+      if (existing) {
+        // Replace only the coordinate value; keep id/qualifiers/references.
+        const claim = JSON.parse(JSON.stringify(existing));
+        delete claim.mainsnak.hash;
+        claim.mainsnak.snaktype = "value";
+        const old = claim.mainsnak.datavalue && claim.mainsnak.datavalue.value;
+        if (old && old.precision) coord.precision = old.precision;
+        claim.mainsnak.datavalue = { type: "globecoordinate", value: coord };
+        body.set("action", "wbsetclaim");
+        body.set("claim", JSON.stringify(claim));
+      } else {
+        body.set("action", "wbcreateclaim");
+        body.set("entity", mid);
+        body.set("property", prop);
+        body.set("snaktype", "value");
+        body.set("value", JSON.stringify(coord));
+      }
+      await sdcCall(body, token);
+    }
+  }
+
+  // ---- The Save button ------------------------------------------------------------------
+  async function saveEdits() {
+    if (saving) return;
+    if (!OAUTH_TOKEN) {
+      LOS.status.set("No OAuth token — add oauth_config.local.js to enable saving", false);
+      return;
+    }
+    const dirty = LOS.store.dirtyRecs();
+    if (!dirty.length) return;
+    clearRetryTimer(); // a manual save supersedes any countdown
+    saving = true;
+    LOS.edit.updateEditUI();
+    const sdcOn = await detectSdcProxy(); // SDC needs the serve.py proxy
+    const savedUrls = new Set(), failures = [];
+    for (let i = 0; i < dirty.length; i++) {
+      const rec = dirty[i];
+      LOS.status.set(`Saving ${i + 1}/${dirty.length} — ${U.prettyTitle(rec.title)}`, true);
+      try {
+        await savePhotoEdits(rec, OAUTH_TOKEN, sdcOn);
+        rec.origCam = rec.cam && rec.cam.slice(); // saved: this is the new baseline
+        rec.origObj = rec.obj && rec.obj.slice();
+        LOS.store.rebuildPhotoFeatures(rec);      // drop the edited flag → filters apply again
+        savedUrls.add(rec.url);
+      } catch (err) {
+        failures.push(`${U.prettyTitle(rec.title)}: ${err.message}`);
+      }
+    }
+    // Saved photos leave the undo stack; failed ones keep their edits.
+    LOS.edit.dropEditsFor(savedUrls);
+    saving = false;
+    LOS.edit.renderOverlay();
+    LOS.edit.updateEditUI();
+    const sdcNote = sdcOn ? "" : " · SDC skipped — run serve.py to also update structured data";
+    if (failures.length) {
+      onSaveFailure();
+      LOS.status.set(
+        `Save failed for ${U.plural(failures.length, "photo")}` +
+        (savedUrls.size ? ` (${savedUrls.size} saved)` : "") +
+        ` — ${failures[0]}${sdcNote}`, false);
+      console.warn("Save failures:", failures);
+    } else {
+      onSaveSuccess();
+      LOS.status.set(
+        `Saved ${U.plural(savedUrls.size, "photo")}` +
+        (sdcOn ? " (wikitext + SDC) ✓" : ` to Commons ✓${sdcNote}`), false);
+    }
+  }
+
+  function init() {
+    document.getElementById("save-btn").addEventListener("click", saveEdits);
+    $retryBtn.addEventListener("click", () => { clearRetryTimer(); saveEdits(); });
+  }
+
+  LOS.save = {
+    init, saveEdits,
+    isSaving: () => saving,
+    hasToken: () => !!OAUTH_TOKEN,
+    isFailed: () => saveFailed,
+    clearFailure: onSaveSuccess,
+    updateRetryUI,
+  };
+})();

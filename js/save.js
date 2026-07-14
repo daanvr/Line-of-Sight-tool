@@ -107,9 +107,14 @@
   // ---- Edit summaries ----------------------------------------------------------------
   /** Deep link that reopens this tool with the photo loaded, selected, and the
       map fitted to its full line of sight (camera + object) — see the URL
-      preload in main.js. Underscores keep the link readable in histories. */
-  function deepLink(title) {
-    return `${C.TOOL_URL}?file=${encodeURIComponent(String(title).replace(/^File:/, "").replace(/ /g, "_"))}`;
+      preload in main.js. The M-id form keeps summaries short (file names can
+      be hundreds of percent-encoded bytes) and survives file renames; the
+      filename form is the fallback for the rare record without a pageId. */
+  function deepLink(rec) {
+    const target = rec.pageId
+      ? `M${rec.pageId}`
+      : encodeURIComponent(String(rec.title).replace(/^File:/, "").replace(/ /g, "_"));
+    return `${C.TOOL_URL}?file=${target}`;
   }
 
   /** Human-readable per-edit description for the summary: what changed and by
@@ -121,11 +126,12 @@
       : `Add ${noun}`;
   }
 
-  function editSummary(descs, title) {
-    // External URLs don't render as links in edit summaries, but the deep
-    // link is still copyable and machine-parsable. Total stays well under
-    // the 500-codepoint summary limit.
-    return `${descs.join("; ")} — via Line of Sight tool | ${deepLink(title)}`;
+  function editSummary(descs, rec) {
+    // External URLs can't render as links in edit summaries (only wikilinks
+    // and interwiki prefixes do), but the deep link stays copyable and
+    // machine-parsable. No "via …" attribution: the OAuth consumer already
+    // tags every edit with the tool's name.
+    return `${descs.join("; ")} — ${deepLink(rec)}`;
   }
 
   // ---- Saving one photo (wikitext via the Core REST API) -------------------------------
@@ -156,7 +162,7 @@
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify({
         source: text,
-        comment: editSummary(descs, rec.title),
+        comment: editSummary(descs, rec),
         latest: { id: page.latest.id },
       }),
     });
@@ -215,16 +221,15 @@
         globe: SDC_GLOBE,
       };
       const existing = statements[prop] && statements[prop][0];
-      // Summary mirrors the wikitext one: action + property + moved distance.
-      // NOTE: no `tags=` — a change tag (e.g. "line-of-sight-tool") must first
-      // be registered at Special:Tags on Commons; add it to this body then.
+      // The software auto-prepends "Changed/Created claim: <property>: <value>"
+      // to SDC summaries and the OAuth consumer tag names the tool, so all
+      // the summary adds is the moved distance and the deep link.
       const oldVal = existing?.mainsnak?.datavalue?.value;
-      let summary = (existing ? "Move " : "Add ") +
-        (kind === "camera" ? "point-of-view coordinates (P1259)" : "depicted-place coordinates (P9149)");
+      let summary = existing ? "Moved" : "Added";
       if (oldVal && isFinite(oldVal.latitude) && isFinite(oldVal.longitude)) {
         summary += ` ${U.fmtDist(U.distance(oldVal.longitude, oldVal.latitude, pos[0], pos[1]))}`;
       }
-      summary += ` — via Line of Sight tool | ${deepLink(rec.title)}`;
+      summary += ` — ${deepLink(rec)}`;
       const body = new URLSearchParams({ format: "json", token: csrf, maxlag: "5", summary });
       if (existing) {
         // Replace only the coordinate value; keep id/qualifiers/references.

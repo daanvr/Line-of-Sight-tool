@@ -3,18 +3,16 @@
    Wikitext templates ({{Location dec}} / {{Object location dec}}) are updated
    through the MediaWiki REST API (CORS-friendly with a Bearer token). The
    structured-data (SDC) statements — P1259 point of view / P9149 depicted
-   place — need the action API, which browsers can't reach authenticated
-   cross-origin, so SDC only happens behind the serve.py same-origin proxy.
+   place — go through the action API with `crossorigin=` in the URL, which
+   (since MediaWiki 1.44) lets OAuth Bearer requests stay authenticated
+   cross-origin. So both work from anywhere the page is hosted, GitHub Pages
+   included.
    Also owns the failed-save retry (auto backoff: 3s → 10s → 30s → manual). */
 (function () {
   "use strict";
   const LOS = (window.LOS = window.LOS || {});
   const C = LOS.config;
   const U = LOS.util;
-
-  // Local, git-ignored OAuth config: window.LOS_OAUTH = { accessToken: "…" }.
-  // Missing file is fine — saving is simply disabled.
-  const OAUTH_TOKEN = window.LOS_OAUTH?.accessToken || null;
 
   let saving = false;
 
@@ -131,11 +129,11 @@
   }
 
   // ---- Saving one photo (wikitext via the Core REST API) -------------------------------
-  async function savePhotoEdits(rec, token, sdcOn) {
+  async function savePhotoEdits(rec, token) {
     const endpoint = C.REST_API + encodeURIComponent(rec.title);
     const headers = {
       "Authorization": `Bearer ${token}`,
-      "Api-User-Agent": "LineOfSightTool/0.1 (local testing)",
+      "Api-User-Agent": C.USER_AGENT,
     };
     const g = await fetch(endpoint, { headers });
     if (!g.ok) throw new Error(`couldn't fetch wikitext (HTTP ${g.status})`);
@@ -171,36 +169,23 @@
       throw new Error(msg);
     }
     // Keep the structured data (SDC) in sync with the wikitext templates.
-    if (sdcOn && rec.pageId) await saveSDCEdits(rec, token, parts);
+    if (rec.pageId) await saveSDCEdits(rec, token, parts);
   }
 
-  // ---- Structured data (SDC) — via the serve.py same-origin proxy ----------------------
-  // The authenticated action API can't be reached cross-origin from a browser
-  // (its CORS mode anonymizes requests), so SDC edits only happen when the
-  // page is served by serve.py, which proxies /w/ to commons.wikimedia.org.
-  const SDC_API = "/w/api.php";
+  // ---- Structured data (SDC) — action API, authenticated CORS ---------------------------
+  // `origin=*` anonymizes requests, but `crossorigin=` (MediaWiki 1.44+) keeps
+  // header-based auth like our OAuth Bearer token. It must sit in the URL's
+  // query string — not the POST body — so the CORS preflight sees it.
+  const SDC_API = C.COMMONS_API + "?crossorigin=";
   const SDC_CAMERA_PROP = "P1259"; // coordinates of the point of view
   const SDC_OBJECT_PROP = "P9149"; // coordinates of depicted place
   const SDC_GLOBE = "http://www.wikidata.org/entity/Q2";
-  let sdcProxyState = null; // null = not probed yet
-
-  async function detectSdcProxy() {
-    if (sdcProxyState !== null) return sdcProxyState;
-    try {
-      const r = await fetch(`${SDC_API}?action=query&meta=siteinfo&siprop=general&format=json`);
-      const j = r.ok ? await r.json() : null;
-      sdcProxyState = !!(j && j.query);
-    } catch {
-      sdcProxyState = false;
-    }
-    return sdcProxyState;
-  }
 
   async function sdcCall(params, token) {
-    const opts = { headers: { "Authorization": `Bearer ${token}` } };
+    const opts = { headers: { "Authorization": `Bearer ${token}`, "Api-User-Agent": C.USER_AGENT } };
     let url = SDC_API;
     if (params instanceof URLSearchParams) { opts.method = "POST"; opts.body = params; }
-    else url += `?${params}`;
+    else url += `&${params}`;
     const r = await fetch(url, opts);
     if (!r.ok) throw new Error(`SDC request failed (HTTP ${r.status})`);
     const j = await r.json();
@@ -265,8 +250,17 @@
   // ---- The Save button ------------------------------------------------------------------
   async function saveEdits() {
     if (saving) return;
-    if (!OAUTH_TOKEN) {
-      LOS.status.set("No OAuth token — add oauth_config.local.js to enable saving", false);
+    // Not signed in → run the OAuth flow first (login() opens its popup
+    // synchronously, so calling it straight from the click keeps blockers
+    // happy). A successful sign-in falls through into the save.
+    if (!LOS.auth.hasSession()) {
+      const ok = await LOS.auth.login();
+      if (!ok) return;
+    }
+    const token = await LOS.auth.getToken();
+    if (!token) {
+      LOS.status.set("Sign-in expired — click Save to sign in again", false);
+      LOS.edit.updateEditUI();
       return;
     }
     const dirty = LOS.store.dirtyRecs();
@@ -274,13 +268,12 @@
     clearRetryTimer(); // a manual save supersedes any countdown
     saving = true;
     LOS.edit.updateEditUI();
-    const sdcOn = await detectSdcProxy(); // SDC needs the serve.py proxy
     const savedUrls = new Set(), failures = [];
     for (let i = 0; i < dirty.length; i++) {
       const rec = dirty[i];
       LOS.status.set(`Saving ${i + 1}/${dirty.length} — ${U.prettyTitle(rec.title)}`, true);
       try {
-        await savePhotoEdits(rec, OAUTH_TOKEN, sdcOn);
+        await savePhotoEdits(rec, token);
         rec.origCam = rec.cam && rec.cam.slice(); // saved: this is the new baseline
         rec.origObj = rec.obj && rec.obj.slice();
         LOS.store.rebuildPhotoFeatures(rec);      // drop the edited flag → filters apply again
@@ -294,19 +287,16 @@
     saving = false;
     LOS.edit.renderOverlay();
     LOS.edit.updateEditUI();
-    const sdcNote = sdcOn ? "" : " · SDC skipped — run serve.py to also update structured data";
     if (failures.length) {
       onSaveFailure();
       LOS.status.set(
         `Save failed for ${U.plural(failures.length, "photo")}` +
         (savedUrls.size ? ` (${savedUrls.size} saved)` : "") +
-        ` — ${failures[0]}${sdcNote}`, false);
+        ` — ${failures[0]}`, false);
       console.warn("Save failures:", failures);
     } else {
       onSaveSuccess();
-      LOS.status.set(
-        `Saved ${U.plural(savedUrls.size, "photo")}` +
-        (sdcOn ? " (wikitext + SDC) ✓" : ` to Commons ✓${sdcNote}`), false);
+      LOS.status.set(`Saved ${U.plural(savedUrls.size, "photo")} (wikitext + SDC) ✓`, false);
     }
   }
 
@@ -318,7 +308,7 @@
   LOS.save = {
     init, saveEdits,
     isSaving: () => saving,
-    hasToken: () => !!OAUTH_TOKEN,
+    hasToken: () => LOS.auth.hasSession(),
     isFailed: () => saveFailed,
     clearFailure: onSaveSuccess,
     updateRetryUI,

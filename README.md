@@ -74,27 +74,59 @@ classic scripts so opening the file directly (no server) still works.
 | `⇧E` | Toggle edit mode manually. |
 | `Esc` | Cancel placing / selection / menus / viewer / deselect photo / list, in that order. After deselecting, `↑`/`↓` resume where the selection was. |
 
-## Editing setup (local testing)
+## Editing setup
 
-Saving to Commons needs an OAuth 2.0 access token. Create a git-ignored `oauth_config.local.js`
-next to `index.html`:
+Saving runs a standard OAuth 2.0 **authorization-code + PKCE** flow entirely in the browser
+(Meta-Wiki's token endpoint allows CORS), so the tool stays a plain static site — GitHub
+Pages is all it takes. Users click **Sign in to save**, approve the app on Meta-Wiki in a
+popup, and the tool keeps the session in `localStorage`, refreshing the ~4-hour access
+tokens automatically.
 
-```js
-window.LOS_OAUTH = { accessToken: "…your OAuth2 access token…" };
-```
+One-time client registration (needs a Wikimedia account with a confirmed email):
 
-Without it everything works read-only: you can still make and review edits, but the Save
-button stays disabled with a hint.
+1. Open [Special:OAuthConsumerRegistration/propose/oauth2](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration/propose/oauth2)
+   on Meta-Wiki.
+2. Fill in:
+   - **Application name** — `Line of Sight tool` (users see this on the consent screen).
+   - **OAuth "callback" URL** — `https://daanvr.github.io/Line-of-Sight-tool/callback.html`
+     (must match exactly; leave *"Allow consumer to specify a callback"* unchecked).
+   - **Untick "This is a confidential client"** — a browser can't keep a secret; this makes
+     it a public PKCE client, which is what `js/auth.js` implements.
+   - Leave *"for use only by [you]"* **unchecked** so other people can sign in too.
+   - **Grants** — *"Request authorization for specific permissions"* → tick
+     **Edit existing pages** only (both the wikitext and SDC edits are edits to existing
+     file pages).
+3. Submit, then paste the **client ID** into `OAUTH_CLIENT_ID` in `js/config.js`
+   (ignore the client secret — public clients don't use it).
 
-For **structured-data (SDC) updates** the page must be served by the bundled proxy — browsers
-can't reach the authenticated Commons action API cross-origin:
+A freshly proposed consumer works **immediately for its owner** — you can test the full
+flow right away. Other accounts can only sign in after an OAuth administrator approves the
+consumer (it lands in [the approval queue](https://meta.wikimedia.org/wiki/Special:OAuthManageConsumers);
+usually a few days).
+
+Both wikitext and structured-data (SDC) updates work from any origin — the SDC calls go
+through the action API with the `crossorigin=` parameter, which since MediaWiki 1.44 keeps
+OAuth Bearer requests authenticated cross-origin.
+
+### Local development
+
+The sign-in popup needs the exact registered callback, so on `localhost` either:
+
+- create a git-ignored `oauth_config.local.js` with a personal access token (from an
+  owner-only OAuth 2 consumer) — this skips the sign-in flow entirely:
+
+  ```js
+  window.LOS_OAUTH = { accessToken: "…your OAuth2 access token…" };
+  ```
+
+- or register a second (dev) consumer with callback `http://localhost:8000/callback.html`
+  and point the same file at it: `window.LOS_OAUTH = { clientId: "…dev client id…" };`
+
+Any static server does:
 
 ```sh
 python3 serve.py          # → http://localhost:8000/
 ```
-
-Opened any other way (file://, plain `http.server`, GitHub Pages), saving still updates the
-wikitext but skips SDC and says so in the status pill.
 
 ## Usage
 
@@ -129,6 +161,7 @@ preload any `?files=` photos).
 | `js/categories.js` | the category search box (suggest / search / drill-down / add) |
 | `js/select.js` | polygon selection |
 | `js/edit.js` | edit mode: drag, click-to-place, undo/redo, overlay, edit list |
+| `js/auth.js` | Wikimedia OAuth 2.0 sign-in (PKCE popup flow, token refresh) |
 | `js/save.js` | writing to Commons: wikitext templates, SDC statements, retry |
 | `js/ctxmenu.js` | the right-click menus |
 | `js/keys.js` | the global keyboard router |

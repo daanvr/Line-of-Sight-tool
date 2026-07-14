@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Signing in…</title>
+</head>
+<body style="background:#111;margin:0">
+  <p style="font:13px system-ui;color:#999;padding:24px">Completing sign-in…</p>
+  <!-- OAuth redirect target. Normally we're a popup: hand the code to the
+       opener and close. Without an opener (popup blocked → full-page flow,
+       or the opener link was severed) forward the code to the app itself —
+       js/auth.js completes the exchange either way. -->
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      var code = q.get("code"), state = q.get("state");
+      var err = q.get("error_description") || q.get("error");
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage(
+          code
+            ? { type: "los-oauth", code: code, state: state }
+            : { type: "los-oauth-error", message: err || "authorization was cancelled" },
+          location.origin);
+        window.close();
+      } else {
+        location.replace("./" + (code
+          ? "?code=" + encodeURIComponent(code) + "&state=" + encodeURIComponent(state)
+          : ""));
+      }
+    })();
+  </script>
+</body>
+</html>

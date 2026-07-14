@@ -96,6 +96,7 @@
   LOS.categories.init();
   LOS.select.init();
   LOS.edit.init();
+  LOS.auth.init();
   LOS.save.init();
   LOS.ctxmenu.init();
   LOS.keys.init();

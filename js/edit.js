@@ -338,10 +338,14 @@
 
     const save = LOS.save;
     const dirtyN = LOS.store.dirtyRecs().length;
-    $saveBtn.disabled = !dirtyN || save.isSaving() || !save.hasToken();
+    // No session? The button stays clickable — it runs the OAuth sign-in
+    // first and then saves.
+    $saveBtn.disabled = !dirtyN || save.isSaving();
     $saveBtn.textContent = save.isSaving()
       ? "Saving…"
-      : (dirtyN ? `Save ${U.plural(dirtyN, "photo")}` : "Save");
+      : (dirtyN && !save.hasToken())
+        ? "Sign in to save"
+        : (dirtyN ? `Save ${U.plural(dirtyN, "photo")}` : "Save");
     // The save button escalates as unsaved edits pile up.
     $saveBtn.classList.toggle("some", n >= 1 && n < 5);
     $saveBtn.classList.toggle("warn", n >= 5 && n < 10);
@@ -349,8 +353,17 @@
     // Undoing everything away also cancels a pending failed-save retry.
     if (save.isFailed() && !dirtyN) save.clearFailure();
     $editNote.textContent = dirtyN && !save.hasToken()
-      ? "No OAuth token — add oauth_config.local.js to save"
+      ? "Saving needs a Wikimedia account sign-in"
       : (save.isFailed() ? "Saving failed — will retry" : "");
+    // Sign-out button: only when signed in through the OAuth flow (the
+    // dev-override token has nothing to sign out of).
+    const $authBtn = document.getElementById("auth-btn");
+    if ($authBtn) {
+      const authed = save.hasToken() && !LOS.auth.isOverride();
+      $authBtn.style.display = authed ? "" : "none";
+      const who = LOS.auth.username();
+      $authBtn.title = `Signed in${who ? ` as ${who}` : ""} — click to sign out`;
+    }
     save.updateRetryUI();
 
     renderEditList();

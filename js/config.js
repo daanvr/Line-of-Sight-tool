@@ -11,6 +11,15 @@
       "pk.eyJ1IjoiZ291ZGFwcGVsIiwiYSI6ImNqeXprc3phbjAybTEzZGxqZzR1OHZqOWEifQ.jRzPHdAKKUmyL72_8-2glw",
 
     COMMONS_API: "https://commons.wikimedia.org/w/api.php",
+    // Sent as Api-User-Agent on authenticated Commons calls (WMF UA policy).
+    USER_AGENT: "LineOfSightTool/0.1 (https://daanvr.github.io/Line-of-Sight-tool/)",
+
+    // OAuth 2.0 sign-in — a public PKCE client registered on Meta-Wiki (see
+    // README, "Editing setup"). Paste the client ID from the registration
+    // here; while it's empty the Save button explains how to set it up.
+    OAUTH_CLIENT_ID: "1e13c6dd6a67bf4b1011a02243484396",
+    OAUTH_AUTHORIZE: "https://meta.wikimedia.org/w/rest.php/oauth2/authorize",
+    OAUTH_TOKEN: "https://meta.wikimedia.org/w/rest.php/oauth2/access_token",
     FILEPATH: "https://commons.wikimedia.org/wiki/Special:FilePath/",
     LOCATOR: "https://locator-tool.toolforge.org/#/geolocate?files=",
     // MediaWiki REST API on Commons: unlike action=api.php it accepts CORS

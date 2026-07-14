@@ -55,6 +55,7 @@
     <label class="show-edits" title="Show all edits on the map (original → new)"><input type="checkbox" id="edit-show" checked>edits</label>
     <button id="save-btn" disabled>Save</button>
     <button id="retry-btn" title="Retry the failed save">Try again</button>
+    <button class="ico" id="auth-btn" style="display:none" title="Sign out">👤</button>
     <span class="note" id="edit-note"></span>
   </div>
 
@@ -93,8 +94,10 @@
     </div>
   </div>
 
-  <!-- Local, git-ignored OAuth config: window.LOS_OAUTH = { accessToken: "…" }.
-       Missing file is fine — saving is simply disabled. -->
+  <!-- Local, git-ignored dev override: window.LOS_OAUTH = { accessToken: "…" }
+       skips the sign-in flow entirely; { clientId: "…" } swaps in a dev OAuth
+       client (e.g. one with a localhost callback). Missing file is fine —
+       users sign in through the normal OAuth flow instead. -->
   <script src="oauth_config.local.js"></script>
 
   <!-- App modules (classic scripts so file:// still works — no build step).
@@ -112,6 +115,7 @@
   <script src="js/categories.js"></script>
   <script src="js/select.js"></script>
   <script src="js/edit.js"></script>
+  <script src="js/auth.js"></script>
   <script src="js/save.js"></script>
   <script src="js/ctxmenu.js"></script>
   <script src="js/panel.js"></script>
